@@ -4,11 +4,14 @@ Homer Tracker configuration.
 Centralized settings for API endpoints, seasons, and model parameters.
 """
 
+from datetime import datetime as _dt
+
 # MLB Stats API (free, no key required)
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
 
-# Default season
-CURRENT_SEASON = 2025
+# Auto-detect current season from date
+# MLB seasons run Apr-Oct; if we're in Jan-Mar, use previous year
+CURRENT_SEASON = _dt.now().year if _dt.now().month >= 3 else _dt.now().year - 1
 
 # Feature engineering defaults
 ROLLING_WINDOW = 15      # games for rolling averages (larger window for 162-game season)
@@ -26,6 +29,10 @@ RANDOM_STATE = 42     # reproducibility
 RECENCY_FULL_WEIGHT_GAMES = 162   # ~1 full season gets weight 1.0
 RECENCY_MIN_WEIGHT = 0.15         # oldest data never drops below this
 RECENCY_DECAY_RATE = 0.004        # exponential decay speed for older games
+
+# Automation — how often to retrain models
+RETRAIN_INTERVAL_GAMES = 75   # retrain after this many new games collected
+RETRAIN_INTERVAL_DAYS = 7     # or retrain if it's been this many days
 
 # Park HR factors (2024 data — higher = more HR-friendly)
 # Source: ESPN Park Factors / Baseball Savant

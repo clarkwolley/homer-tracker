@@ -1,12 +1,22 @@
 """
 Daily automation runner for Homer Tracker.
 
+The full daily pipeline (runs every morning):
+1. COLLECT  — fetch yesterday's boxscores (incremental, ~15 seconds)
+2. GRADE    — score yesterday's predictions vs actual HR results
+3. RETRAIN  — retrain models if stale (every ~75 games or 7 days)
+4. PREDICT  — generate tonight's HR picks + game winner predictions
+5. NOTIFY   — deliver report via email + Telegram
+
 Usage:
-    python -m src.automation.runner              # Full daily run
+    python -m src.automation.runner              # Full daily pipeline
     python -m src.automation.runner --predict    # Predictions only
     python -m src.automation.runner --grade      # Grade yesterday only
+    python -m src.automation.runner --collect    # Collect data only
+    python -m src.automation.runner --retrain    # Force retrain
+    python -m src.automation.runner --catchup 7  # Collect last N days
     python -m src.automation.runner --notify     # Re-send latest report
-    python -m src.automation.runner --status     # Check config status
+    python -m src.automation.runner --status     # Check system status
 """
 
 import os
@@ -25,19 +35,44 @@ def _setup_logging() -> logging.Logger:
     logger = logging.getLogger("homer-tracker")
     logger.setLevel(logging.INFO)
 
-    fh = logging.FileHandler(os.path.join(LOG_DIR, "runner.log"))
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
-                                       datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(fh)
+    # Avoid duplicate handlers on repeated calls
+    if not logger.handlers:
+        fh = logging.FileHandler(os.path.join(LOG_DIR, "runner.log"))
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(fh)
 
-    sh = logging.StreamHandler()
-    sh.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(sh)
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(sh)
 
     return logger
 
 
-def step_grade_yesterday(log: logging.Logger) -> None:
+# --- Pipeline steps ----------------------------------------------------------
+
+
+def step_collect(log: logging.Logger, catchup_days: int = 1) -> None:
+    """Collect recent game data (default: yesterday only)."""
+    from src.data.collect_daily import collect_yesterday, collect_catchup
+
+    if catchup_days > 1:
+        log.info(f"📦 Collecting last {catchup_days} days of games...")
+        collect_catchup(catchup_days)
+    else:
+        log.info("📦 Collecting yesterday's games...")
+        stats = collect_yesterday()
+        log.info(
+            f"   Found {stats.get('found', 0)} games, "
+            f"{stats.get('new', 0)} new, "
+            f"{stats.get('collected', 0)} collected"
+        )
+
+
+def step_grade(log: logging.Logger) -> None:
+    """Grade yesterday's predictions against actual results."""
     from src.predictions.tracker import grade_predictions, save_graded, print_scorecard
     from src.notifications.telegram_sender import send_grade
 
@@ -58,7 +93,22 @@ def step_grade_yesterday(log: logging.Logger) -> None:
         log.warning(f"   Telegram grade notification failed: {e}")
 
 
-def step_predict_today(log: logging.Logger) -> tuple:
+def step_retrain(log: logging.Logger, force: bool = False) -> None:
+    """Retrain models if needed (or forced)."""
+    from src.automation.retrain import retrain_if_needed, should_retrain
+
+    if force:
+        log.info("🏗️  Forced retraining...")
+        from src.train import train_hr_model, train_game_model
+        train_hr_model()
+        train_game_model()
+        log.info("   ✅ Retraining complete")
+    else:
+        retrain_if_needed(log)
+
+
+def step_predict(log: logging.Logger) -> tuple:
+    """Generate tonight's predictions."""
     from src.predictions.daily import (
         predict_tonight, print_top_picks,
         predict_game_winners, print_game_picks,
@@ -86,12 +136,13 @@ def step_predict_today(log: logging.Logger) -> tuple:
     return pred_df, game_df, report_path
 
 
-def step_notify(log, pred_df=None, report_path=None) -> None:
+def step_notify(log: logging.Logger, pred_df=None, report_path=None) -> None:
+    """Deliver predictions via email + Telegram."""
     from src.notifications.email_sender import send_report
     from src.notifications.telegram_sender import send_picks
     from src.notifications.settings import is_email_configured, is_telegram_configured
 
-    if pred_df is None or (hasattr(pred_df, 'empty') and pred_df.empty):
+    if pred_df is None or (hasattr(pred_df, "empty") and pred_df.empty):
         log.info("   No predictions to deliver.")
         return
 
@@ -117,6 +168,9 @@ def step_notify(log, pred_df=None, report_path=None) -> None:
         log.info("   ⏭️  Telegram not configured.")
 
 
+# --- Utilities ---------------------------------------------------------------
+
+
 def _find_latest_report() -> str | None:
     pattern = os.path.join(REPORT_DIR, "picks_*.html")
     files = sorted(glob.glob(pattern), reverse=True)
@@ -124,51 +178,88 @@ def _find_latest_report() -> str | None:
 
 
 def check_status() -> None:
+    """Print full system status."""
     from src.notifications.settings import is_email_configured, is_telegram_configured
+    from src.data.collect_daily import games_since_last_train, days_since_last_train
+    from src.config import RETRAIN_INTERVAL_GAMES, RETRAIN_INTERVAL_DAYS
 
     print("\n🐶 Homer Tracker — System Status")
-    print("=" * 50)
+    print("=" * 55)
 
-    print(f"  📧 Email:    {'✅ configured' if is_email_configured() else '❌ not configured'}")
-    print(f"  💬 Telegram: {'✅ configured' if is_telegram_configured() else '❌ not configured'}")
+    # Notification config
+    print(f"  📧 Email:      {'✅ configured' if is_email_configured() else '❌ not configured'}")
+    print(f"  💬 Telegram:   {'✅ configured' if is_telegram_configured() else '❌ not configured'}")
 
+    # Models
     model_path = os.path.join(os.path.dirname(__file__), "..", "..", "models", "hr_model.pkl")
-    print(f"  🤖 HR Model: {'✅ trained' if os.path.exists(model_path) else '❌ not trained'}")
-
     game_model = os.path.join(os.path.dirname(__file__), "..", "..", "models", "game_model.pkl")
+    print(f"  🤖 HR Model:   {'✅ trained' if os.path.exists(model_path) else '❌ not trained'}")
     print(f"  🏆 Game Model: {'✅ trained' if os.path.exists(game_model) else '❌ not trained'}")
 
+    # Data
     data_path = os.path.join(os.path.dirname(__file__), "..", "..", "data", "game_log.csv")
-    print(f"  📊 Data:     {'✅ collected' if os.path.exists(data_path) else '❌ no data'}")
+    if os.path.exists(data_path):
+        import pandas as pd
+        gl = pd.read_csv(data_path, usecols=["game_pk", "game_date"])
+        n_games = gl["game_pk"].nunique()
+        date_range = f"{gl['game_date'].min()} → {gl['game_date'].max()}"
+        print(f"  📊 Data:       ✅ {n_games:,} games ({date_range})")
+    else:
+        print(f"  📊 Data:       ❌ no data")
 
+    # Freshness
+    if os.path.exists(model_path):
+        new_games = games_since_last_train()
+        days_old = days_since_last_train()
+        fresh = new_games < RETRAIN_INTERVAL_GAMES and days_old < RETRAIN_INTERVAL_DAYS
+        icon = "✅" if fresh else "🟡"
+        print(f"  🔄 Freshness:  {icon} {new_games} new games, {days_old}d since training")
+        print(f"                 (retrain at {RETRAIN_INTERVAL_GAMES} games or {RETRAIN_INTERVAL_DAYS} days)")
+
+    # Latest report
     latest = _find_latest_report()
-    print(f"  📄 Latest:   {os.path.basename(latest) if latest else 'no reports yet'}")
+    print(f"  📄 Latest:     {os.path.basename(latest) if latest else 'no reports yet'}")
 
-    print("=" * 50)
+    print("=" * 55)
     if not is_email_configured() or not is_telegram_configured():
         print("\n  💡 Run: python -m src.automation.setup\n")
 
 
-def run(mode: str = "full") -> None:
+# --- Main entrypoint ---------------------------------------------------------
+
+
+def run(mode: str = "full", catchup_days: int = 1) -> None:
+    """Execute the daily pipeline."""
     if mode == "status":
         check_status()
         return
 
     log = _setup_logging()
-    log.info(f"{'=' * 50}")
+    log.info(f"{'=' * 55}")
     log.info(f"⚾ Homer Tracker Runner — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     log.info(f"   Mode: {mode}")
 
     try:
-        if mode in ("full", "grade"):
-            step_grade_yesterday(log)
+        # Step 1: Collect new data
+        if mode in ("full", "collect", "catchup"):
+            step_collect(log, catchup_days=catchup_days)
 
+        # Step 2: Grade yesterday
+        if mode in ("full", "grade"):
+            step_grade(log)
+
+        # Step 3: Retrain if needed
+        if mode in ("full", "retrain"):
+            force = mode == "retrain"
+            step_retrain(log, force=force)
+
+        # Step 4: Predict tonight
         pred_df = None
         report_path = None
-
         if mode in ("full", "predict"):
-            pred_df, _, report_path = step_predict_today(log)
+            pred_df, _, report_path = step_predict(log)
 
+        # Step 5: Notify
         if mode in ("full", "predict", "notify"):
             if mode == "notify":
                 from src.predictions.tracker import PICKS_FILE
@@ -190,11 +281,31 @@ def run(mode: str = "full") -> None:
 
 def main():
     mode = "full"
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lstrip("-")
-        if arg in ("predict", "grade", "notify", "status"):
-            mode = arg
-    run(mode)
+    catchup_days = 1
+
+    args = sys.argv[1:]
+
+    if "--status" in args:
+        mode = "status"
+    elif "--predict" in args:
+        mode = "predict"
+    elif "--grade" in args:
+        mode = "grade"
+    elif "--collect" in args:
+        mode = "collect"
+    elif "--retrain" in args:
+        mode = "retrain"
+    elif "--notify" in args:
+        mode = "notify"
+    elif "--catchup" in args:
+        mode = "catchup"
+        idx = args.index("--catchup")
+        if idx + 1 < len(args):
+            catchup_days = int(args[idx + 1])
+        else:
+            catchup_days = 7
+
+    run(mode, catchup_days=catchup_days)
 
 
 if __name__ == "__main__":
