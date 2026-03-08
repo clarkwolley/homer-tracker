@@ -6,6 +6,10 @@ Binary classification: "Will this batter hit a HR tonight?"
 
 We train Logistic Regression (baseline) and Gradient Boosting (advanced),
 compare them, and save the winner.
+
+Recency weighting: the most recent ~162 game-dates (one full season)
+get full weight. Older games decay exponentially — they still contribute
+context but don't overpower recent form.
 """
 
 import os
@@ -24,6 +28,7 @@ from src.features.batter_features import (
     TARGET_COLUMN,
 )
 from src.models.evaluate import evaluate_model, print_evaluation
+from src.models.weights import compute_recency_weights, print_weight_summary
 
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "models")
@@ -66,10 +71,10 @@ def _inject_training_pitcher_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def prepare_training_data(game_log: pd.DataFrame) -> tuple:
     """
-    Prepare features and target from raw game log.
+    Prepare features, target, and recency weights from raw game log.
 
     Returns:
-        Tuple of (X, y, full_df)
+        Tuple of (X, y, sample_weights, full_df)
     """
     df = build_batter_features(game_log)
     df = _inject_training_pitcher_features(df)
@@ -85,7 +90,10 @@ def prepare_training_data(game_log: pd.DataFrame) -> tuple:
     X = df[FEATURE_COLUMNS].copy()
     y = df[TARGET_COLUMN].copy()
 
-    return X, y, df
+    # Compute recency weights — recent games matter more
+    sample_weights = compute_recency_weights(df["game_date"])
+
+    return X, y, sample_weights, df
 
 
 def train_hr_model(game_log: pd.DataFrame) -> dict:
@@ -94,17 +102,21 @@ def train_hr_model(game_log: pd.DataFrame) -> dict:
 
     Pipeline:
     1. Build features from raw game log
-    2. Split train/test
-    3. Train LR (baseline) and GB (advanced)
-    4. Evaluate and save the best
+    2. Compute recency-based sample weights
+    3. Split train/test (weights travel with their samples)
+    4. Train LR (baseline) and GB (advanced) with sample_weight
+    5. Evaluate and save the best
     """
     print("🏗️  Preparing features...")
-    X, y, df = prepare_training_data(game_log)
+    X, y, sample_weights, df = prepare_training_data(game_log)
     print(f"   {len(X)} samples, {len(FEATURE_COLUMNS)} features")
     print(f"   HR rate: {y.mean()*100:.1f}% of batter-games")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+    print_weight_summary(df["game_date"], sample_weights)
+
+    X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
+        X, y, sample_weights,
+        test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y,
     )
     print(f"   Train: {len(X_train)} | Test: {len(X_test)}")
 
@@ -121,7 +133,7 @@ def train_hr_model(game_log: pd.DataFrame) -> dict:
         class_weight="balanced",
         max_iter=1000,
     )
-    lr.fit(X_train_scaled, y_train)
+    lr.fit(X_train_scaled, y_train, sample_weight=w_train)
     lr_probs = lr.predict_proba(X_test_scaled)[:, 1]
     lr_metrics = evaluate_model(y_test, lr_probs, threshold=0.10)
     print_evaluation(lr_metrics, "Logistic Regression")
@@ -144,7 +156,7 @@ def train_hr_model(game_log: pd.DataFrame) -> dict:
         subsample=0.8,
         random_state=RANDOM_STATE,
     )
-    gb.fit(X_train, y_train)
+    gb.fit(X_train, y_train, sample_weight=w_train)
     gb_probs = gb.predict_proba(X_test)[:, 1]
     gb_metrics = evaluate_model(y_test, gb_probs, threshold=0.10)
     print_evaluation(gb_metrics, "Gradient Boosting")

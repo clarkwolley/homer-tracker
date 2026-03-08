@@ -22,6 +22,11 @@ HIGH_POWER_THRESHOLD = 0.06  # HR per AB above this = power hitter (~25+ HR pace
 TEST_SIZE = 0.2       # 20% of data held out for testing
 RANDOM_STATE = 42     # reproducibility
 
+# Recency weighting — recent games matter more than ancient history
+RECENCY_FULL_WEIGHT_GAMES = 162   # ~1 full season gets weight 1.0
+RECENCY_MIN_WEIGHT = 0.15         # oldest data never drops below this
+RECENCY_DECAY_RATE = 0.004        # exponential decay speed for older games
+
 # Park HR factors (2024 data — higher = more HR-friendly)
 # Source: ESPN Park Factors / Baseball Savant
 PARK_HR_FACTORS = {
