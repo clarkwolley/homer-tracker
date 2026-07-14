@@ -5,6 +5,8 @@ This is the ETL layer. The API client fetches raw JSON, this module
 transforms it into tidy DataFrames for analysis and modeling.
 """
 
+from datetime import date
+
 import pandas as pd
 
 from src.data import mlb_api
@@ -50,14 +52,21 @@ def get_todays_games() -> pd.DataFrame:
     """
     Get today's scheduled games as a clean DataFrame.
 
+    The MLB API already filters by date at the request level, but we
+    double-check against today's actual date as a safety net — same
+    pattern as snipe-tracker where the NHL API returns a full week.
+
     Returns:
         DataFrame: game_pk, date, home_team, away_team, home_id, away_id,
                    game_state, home_score, away_score.
     """
     schedule = mlb_api.get_schedule()
+    today_str = date.today().isoformat()  # 'YYYY-MM-DD'
     games = []
 
     for day in schedule.get("dates", []):
+        if day["date"] != today_str:
+            continue
         for game in day.get("games", []):
             home = game.get("teams", {}).get("home", {}).get("team", {})
             away = game.get("teams", {}).get("away", {}).get("team", {})
@@ -193,16 +202,71 @@ def get_game_batter_stats(game_pk: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _parse_ip(ip_str) -> float:
+    """Convert MLB inningsPitched string ('2.1' = 2⅓ IP) to decimal innings."""
+    try:
+        parts = str(ip_str).split(".")
+        return round(int(parts[0]) + (int(parts[1]) if len(parts) > 1 else 0) / 3, 3)
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def get_game_pitcher_stats(game_pk: int) -> pd.DataFrame:
+    """
+    Get per-pitcher stats from a single game's boxscore.
+
+    Returns one row per pitcher appearance with:
+    game_pk, game_date, player_id, name, team, team_id, is_home,
+    is_starter, innings_pitched, pitches_thrown, batters_faced,
+    earned_runs, strikeouts, walks, games_finished.
+    """
+    box = mlb_api.get_boxscore(game_pk)   # served from cache if batter stats already fetched
+    feed = mlb_api.get_game_feed(game_pk)
+
+    game_date = feed.get("gameData", {}).get("datetime", {}).get("officialDate", "")
+
+    rows = []
+    teams_data = box.get("teams", {})
+
+    for side, is_home in [("away", False), ("home", True)]:
+        team_data = teams_data.get(side, {})
+        team_info = team_data.get("team", {})
+        team_id = team_info.get("id", 0)
+        team_abbrev = team_id_to_abbrev(team_id)
+        pitchers = team_data.get("pitchers", [])
+        players = team_data.get("players", {})
+
+        for i, pitcher_id in enumerate(pitchers):
+            player = players.get(f"ID{pitcher_id}", {})
+            person = player.get("person", {})
+            pitching = player.get("stats", {}).get("pitching", {})
+
+            if not pitching or pitching.get("battersFaced", 0) == 0:
+                continue
+
+            rows.append({
+                "game_pk": game_pk,
+                "game_date": game_date,
+                "player_id": person.get("id", pitcher_id),
+                "name": person.get("fullName", f"Pitcher {pitcher_id}"),
+                "team": team_abbrev,
+                "team_id": team_id,
+                "is_home": is_home,
+                "is_starter": int(i == 0),
+                "innings_pitched": _parse_ip(pitching.get("inningsPitched", "0.0")),
+                "pitches_thrown": pitching.get("numberOfPitches", 0),
+                "batters_faced": pitching.get("battersFaced", 0),
+                "earned_runs": pitching.get("earnedRuns", 0),
+                "strikeouts": pitching.get("strikeOuts", 0),
+                "walks": pitching.get("baseOnBalls", 0),
+                "games_finished": pitching.get("gamesFinished", 0),
+            })
+
+    return pd.DataFrame(rows)
+
+
 def get_team_batters(team_id: int) -> pd.DataFrame:
-    """
-    Get season batting stats for all batters on a team's active roster.
-
-    Args:
-        team_id: MLB team ID.
-
-    Returns:
-        DataFrame with season hitting stats per batter.
-    """
+    """Get season batting stats for all batters on a team's active roster."""
     roster = mlb_api.get_team_roster(team_id)
     team_abbrev = team_id_to_abbrev(team_id)
     rows = []
@@ -210,37 +274,40 @@ def get_team_batters(team_id: int) -> pd.DataFrame:
     for entry in roster.get("roster", []):
         person = entry.get("person", {})
         position = entry.get("position", {}).get("abbreviation", "")
-
-        # Skip pitchers
         if position == "P":
             continue
 
         player_id = person.get("id", 0)
+        player_name = person.get("fullName", "")
+        bat_side = person.get("batSide", {}).get("code", "R")
 
+        # Try current season stats first, fallback to defaults
+        stats = None
         try:
             stats_data = mlb_api.get_player_stats(player_id, group="hitting")
             splits = stats_data.get("stats", [])
-            if not splits or not splits[0].get("splits"):
-                continue
-            stats = splits[0]["splits"][0].get("stat", {})
-        except (mlb_api.MLBApiError, IndexError, KeyError):
-            continue
+            if splits and splits[0].get("splits"):
+                stat_entry = splits[0]["splits"][0].get("stat", {})
+                if stat_entry and stat_entry.get("gamesPlayed", 0) > 0:
+                    stats = stat_entry
+        except (mlb_api.MLBApiError, IndexError, KeyError, AttributeError):
+            pass
 
-        gp = stats.get("gamesPlayed", 0)
-        if gp == 0:
-            continue
+        # Early season: use sensible defaults
+        if stats is None:
+            stats = {
+                "gamesPlayed": 0, "atBats": 3, "hits": 1, "homeRuns": 0,
+                "rbi": 0, "baseOnBalls": 0, "strikeOuts": 0, "stolenBases": 0,
+                "avg": ".333", "obp": ".400", "slg": ".400", "ops": ".800",
+                "plateAppearances": 3,
+            }
 
         rows.append({
-            "player_id": player_id,
-            "name": person.get("fullName", ""),
-            "position": position,
-            "team": team_abbrev,
-            "team_id": team_id,
-            "games_played": gp,
-            "at_bats": stats.get("atBats", 0),
-            "hits": stats.get("hits", 0),
-            "home_runs": stats.get("homeRuns", 0),
-            "rbi": stats.get("rbi", 0),
+            "player_id": player_id, "name": player_name, "position": position,
+            "team": team_abbrev, "team_id": team_id,
+            "games_played": stats.get("gamesPlayed", 0),
+            "at_bats": stats.get("atBats", 0), "hits": stats.get("hits", 0),
+            "home_runs": stats.get("homeRuns", 0), "rbi": stats.get("rbi", 0),
             "walks": stats.get("baseOnBalls", 0),
             "strikeouts": stats.get("strikeOuts", 0),
             "stolen_bases": stats.get("stolenBases", 0),
@@ -249,10 +316,11 @@ def get_team_batters(team_id: int) -> pd.DataFrame:
             "slg": float(stats.get("slg", ".000")),
             "ops": float(stats.get("ops", ".000")),
             "plate_appearances": stats.get("plateAppearances", 0),
-            "bat_side": person.get("batSide", {}).get("code", "R"),
+            "bat_side": bat_side,
         })
 
     return pd.DataFrame(rows)
+
 
 
 def get_probable_pitchers(date: str = "today") -> pd.DataFrame:

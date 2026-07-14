@@ -26,6 +26,7 @@ from src.data.collector import (
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
 GAME_LOG_FILE = os.path.join(DATA_DIR, "game_log.csv")
 GAME_RESULTS_FILE = os.path.join(DATA_DIR, "game_results.csv")
+BULLPEN_LOG_FILE = os.path.join(DATA_DIR, "bullpen_log.csv")
 CHECKPOINT_INTERVAL = 50
 
 
@@ -34,10 +35,18 @@ def _ensure_data_dir():
 
 
 def _load_existing_game_pks() -> set:
-    """Load game PKs we've already collected."""
+    """Load game PKs we've already collected (batter stats)."""
     if not os.path.exists(GAME_LOG_FILE):
         return set()
     df = pd.read_csv(GAME_LOG_FILE, usecols=["game_pk"])
+    return set(df["game_pk"].unique())
+
+
+def _load_existing_bullpen_pks() -> set:
+    """Load game PKs already in the bullpen log."""
+    if not os.path.exists(BULLPEN_LOG_FILE):
+        return set()
+    df = pd.read_csv(BULLPEN_LOG_FILE, usecols=["game_pk"])
     return set(df["game_pk"].unique())
 
 
@@ -185,6 +194,22 @@ def save_game_log(new_data: pd.DataFrame):
     combined = combined.sort_values("game_date").reset_index(drop=True)
     combined.to_csv(GAME_LOG_FILE, index=False)
     print(f"💾 Game log: {len(combined):,} rows ({combined['game_pk'].nunique()} games)")
+
+
+def save_bullpen_log(new_data: pd.DataFrame):
+    """Merge new pitcher-game data with existing bullpen_log.csv."""
+    _ensure_data_dir()
+
+    if os.path.exists(BULLPEN_LOG_FILE):
+        existing = pd.read_csv(BULLPEN_LOG_FILE)
+        combined = pd.concat([existing, new_data], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["game_pk", "player_id"], keep="last")
+    else:
+        combined = new_data
+
+    combined = combined.sort_values("game_date").reset_index(drop=True)
+    combined.to_csv(BULLPEN_LOG_FILE, index=False)
+    print(f"💾 Bullpen log: {len(combined):,} rows ({combined['game_pk'].nunique()} games)")
 
 
 def save_game_results(results_df: pd.DataFrame):

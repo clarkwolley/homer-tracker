@@ -28,11 +28,13 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from src.data import mlb_api
-from src.data.collector import get_game_batter_stats, team_id_to_abbrev
+from src.data.collector import get_game_batter_stats, get_game_pitcher_stats, team_id_to_abbrev
 from src.data.collect_bulk import (
     save_game_log,
     save_game_results,
+    save_bullpen_log,
     _load_existing_game_pks,
+    _load_existing_bullpen_pks,
     DATA_DIR,
     _ensure_data_dir,
 )
@@ -96,32 +98,38 @@ def collect_date(date_str: str, delay: float = 0.35) -> dict:
         print(f"   No completed games for {date_str}")
         return {"date": date_str, "found": 0, "new": 0, "collected": 0}
 
-    existing = _load_existing_game_pks()
-    new_pks = [gpk for gpk in game_pks if gpk not in existing]
+    existing_batter = _load_existing_game_pks()
+    existing_bullpen = _load_existing_bullpen_pks()
+    # Fetch batter stats for games not yet in game_log; pitcher stats for games not yet in bullpen_log
+    new_pks = [gpk for gpk in game_pks if gpk not in existing_batter]
+    new_bullpen_pks = [gpk for gpk in game_pks if gpk not in existing_bullpen]
 
-    print(f"   Found {len(game_pks)} completed games, {len(new_pks)} new")
+    print(f"   Found {len(game_pks)} completed games, {len(new_pks)} new (batters), {len(new_bullpen_pks)} new (pitchers)")
 
-    if not new_pks:
+    if not new_pks and not new_bullpen_pks:
         print(f"   Already have all games for {date_str} ✅")
-        # Still save results in case they were missing
         if not results_df.empty:
             save_game_results(results_df)
         return {"date": date_str, "found": len(game_pks), "new": 0, "collected": 0}
 
-    # Fetch boxscores for new games
-    all_frames = []
+    # Fetch boxscores — union of pks needing either batter or pitcher stats
+    all_new_pks = list(set(new_pks) | set(new_bullpen_pks))
+    batter_frames = []
+    pitcher_frames = []
     failed = []
 
-    for i, gpk in enumerate(new_pks, 1):
+    for i, gpk in enumerate(all_new_pks, 1):
         try:
-            df = get_game_batter_stats(gpk)
-            all_frames.append(df)
+            if gpk in new_pks:
+                batter_frames.append(get_game_batter_stats(gpk))
+            if gpk in new_bullpen_pks:
+                pitcher_frames.append(get_game_pitcher_stats(gpk))  # served from cache if batter fetched first
         except Exception as e:
             failed.append(gpk)
             print(f"   ⚠️  Game {gpk}: {e}")
 
-        if i % 5 == 0 or i == len(new_pks):
-            print(f"   [{i}/{len(new_pks)}] boxscores fetched")
+        if i % 5 == 0 or i == len(all_new_pks):
+            print(f"   [{i}/{len(all_new_pks)}] boxscores fetched")
 
         time.sleep(delay)
 
@@ -129,12 +137,16 @@ def collect_date(date_str: str, delay: float = 0.35) -> dict:
     if not results_df.empty:
         save_game_results(results_df)
 
-    if all_frames:
-        new_data = pd.concat(all_frames, ignore_index=True)
+    if batter_frames:
+        new_data = pd.concat(batter_frames, ignore_index=True)
         save_game_log(new_data)
-        print(f"   ✅ Collected {len(new_data)} batter-game rows from {len(all_frames)} games")
+        print(f"   ✅ Collected {len(new_data)} batter-game rows from {len(batter_frames)} games")
     else:
         new_data = pd.DataFrame()
+
+    if pitcher_frames:
+        new_pitcher_data = pd.concat(pitcher_frames, ignore_index=True)
+        save_bullpen_log(new_pitcher_data)
 
     if failed:
         print(f"   ⚠️  Failed: {len(failed)} games")
@@ -143,7 +155,7 @@ def collect_date(date_str: str, delay: float = 0.35) -> dict:
         "date": date_str,
         "found": len(game_pks),
         "new": len(new_pks),
-        "collected": len(all_frames),
+        "collected": len(batter_frames),
         "failed": len(failed),
         "batter_rows": len(new_data),
     }
