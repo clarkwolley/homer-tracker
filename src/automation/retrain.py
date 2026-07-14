@@ -68,7 +68,7 @@ def retrain_if_needed(log: logging.Logger | None = None) -> bool:
         print(msg)
 
     try:
-        from src.train import train_hr_model, train_game_model
+        from src.train import train_hr_model, train_game_winner_model as train_game_model
 
         hr_result = train_hr_model()
         if hr_result:
